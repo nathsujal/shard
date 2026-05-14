@@ -1,32 +1,49 @@
 [package]
 name = "shard"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+authors = ["sujal-nath"]
+description = "High-performance terminal download manager"
+repository = "https://github.com/nathsujal/shard"
+license = "MIT"
+
+[[bin]]
+name = "shard"
+path = "src/main.rs"
 
 [dependencies]
-# Async runtime (rt-multi-thread + macros required for #[tokio::main])
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# Async runtime — added "net" for UnixStream/UnixListener
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "time", "net"] }
 
-# HTTP client
-reqwest = { version = "0.12", features = ["stream", "rustls-tls"] }
+# HTTP
+reqwest = { version = "0.11", features = ["stream"] }
+futures-util = "0.3"
 
-# Logging & diagnostics
-tracing = "0.1"
-# env-filter feature enables .with_env_filter()
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Progress UI
+indicatif = "0.17"
 
 # Error handling
 thiserror = "1"
+anyhow = "1"
 
-# (Future steps will use these; keeping them now avoids dependency churn)
-tokio-util = { version = "0.7", features = ["io"] }
-async-trait = "0.1"
-futures = "0.3"
-bytes = "1"
-memmap2 = "0.9"
+# Config + serialization
 serde = { version = "1", features = ["derive"] }
-rmp-serde = "1"
-rand = "0.8"
-ratatui = { version = "0.29", features = ["crossterm"] }
-crossterm = "0.28"
-chrono = { version = "0.4", features = ["serde"] }
+serde_json = "1"
+toml = "0.8"
+
+# SQLite persistence (daemon job store)
+sqlx = { version = "0.7", features = ["sqlite", "runtime-tokio-native-tls", "macros"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# TUI
+ratatui = "0.26"
+crossterm = "0.27"
+
+# System dirs (~/.config, ~/Downloads, ~/.local/share)
+dirs = "5"

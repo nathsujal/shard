@@ -1,12 +1,23 @@
-use tracing::info;
-
+mod cli;
+mod config;
+mod daemon;
+mod db;
+mod downloader;
+mod ipc;
+mod queue;
+mod ui;
+mod utils;
+ 
+use anyhow::Result;
+use clap::Parser;
+ 
+use crate::cli::Cli;
+ 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Note: Uses env!("CARGO_PKG_NAME") so it auto-adapts to "shard"
-    tracing_subscriber::fmt()
-        .with_env_filter(format!("info,{}=debug", env!("CARGO_PKG_NAME")))
-        .init();
-
-    info!("shard initialized. Core engine ready.");
-    Ok(())
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+ 
+    let cli = Cli::parse();
+    cli.run().await
 }
+ 
