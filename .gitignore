@@ -1,1 +1,7 @@
 /target
+.gitnexus
+.logs/
+.agent/
+AGENTS.md
+CLAUDE.md
+docs/

@@ -1,4 +1,6 @@
-use std::path::PathBuf;
+//! HTTP download engine: probe, single-stream fallback, parallel chunked download.
+
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -220,6 +222,7 @@ impl DownloadEngine {
         let file = OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(true)
             .open(output_path)
             .await?;
         file.set_len(total_size).await?;
@@ -286,10 +289,11 @@ impl DownloadEngine {
 
 // Per-chunk fetch
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_chunk(
     client: &Client,
     url: &str,
-    output_path: &PathBuf,
+    output_path: &Path,
     file: Arc<tokio::fs::File>,
     chunk: ChunkRange,
     pb: Option<ProgressBar>,

@@ -1,3 +1,5 @@
+//! URL probing (HEAD request) and file chunk splitting for parallel download.
+
 use reqwest::Client;
 use tracing::{debug, warn};
 

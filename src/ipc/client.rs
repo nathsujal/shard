@@ -1,5 +1,4 @@
-// Thin client used by every CLI subcommand.
-// Flow: connect socket → write JSON request line → read JSON response line → return.
+//! Client-side IPC: connects to daemon Unix socket, sends NDJSON requests, reads responses.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

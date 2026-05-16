@@ -1,3 +1,5 @@
+//! TOML configuration file at `~/.config/shard/config.toml`. Loaded once at daemon startup.
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

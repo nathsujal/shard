@@ -1,6 +1,4 @@
-// Listens on a Unix domain socket.
-// Each incoming client connection is handled in its own tokio task.
-// Uses newline-delimited JSON (one Request line in, one Response line out).
+//! Unix socket listener, subscribe handling, daemon startup/shutdown lifecycle.
 
 use anyhow::Result;
 use std::path::PathBuf;

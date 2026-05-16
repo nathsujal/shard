@@ -1,3 +1,5 @@
+//! Terminal progress bar builder for standalone `shard get` mode.
+
 use indicatif::{ProgressBar, ProgressStyle};
 
 pub fn build_progress_bar(total_size: Option<u64>) -> ProgressBar {

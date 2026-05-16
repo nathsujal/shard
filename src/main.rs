@@ -1,3 +1,10 @@
+//! High-performance terminal download manager.
+//!
+//! shard runs as a background daemon process, accepts commands via Unix socket IPC,
+//! and provides a real-time TUI for interactive use. The CLI is parsed by clap.
+
+#![deny(unsafe_code)]
+
 mod cli;
 mod config;
 mod daemon;
@@ -15,7 +22,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use crate::cli::Cli;
 
 fn init_logging() -> WorkerGuard {
-    let log_dir = "logs";
+    let log_dir = ".logs";
 
     std::fs::create_dir_all(log_dir).ok();
 

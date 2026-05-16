@@ -48,3 +48,10 @@ crossterm = "0.27"
 
 # System dirs (~/.config, ~/Downloads, ~/.local/share)
 dirs = "5"
+
+[lints.clippy]
+correctness = "deny"
+suspicious = "warn"
+style = "warn"
+complexity = "warn"
+perf = "warn"
