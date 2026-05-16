@@ -30,6 +30,9 @@ pub struct QueueManager {
     next_id: Arc<AtomicU64>,
     event_tx: broadcast::Sender<ManagerEvent>,
     runner_running: Arc<AtomicBool>,
+    // ── NEW: fired by download tasks when they finish, so server can re-trigger
+    //         run_all_with_db to pick up any Pending jobs that were waiting for a slot.
+    pub run_trigger_tx: broadcast::Sender<()>,
 }
 
 impl QueueManager {
@@ -45,6 +48,7 @@ impl QueueManager {
             .expect("failed to build HTTP client");
 
         let (event_tx, _) = broadcast::channel(256);
+        let (run_trigger_tx, _) = broadcast::channel(16); // NEW
 
         Self {
             client,
@@ -54,11 +58,18 @@ impl QueueManager {
             next_id: Arc::new(AtomicU64::new(1)),
             event_tx,
             runner_running: Arc::new(AtomicBool::new(false)),
+            run_trigger_tx, // NEW
         }
     }
 
     pub fn event_tx(&self) -> broadcast::Sender<ManagerEvent> {
         self.event_tx.clone()
+    }
+
+    /// Returns sender so server.rs can subscribe and re-trigger run_all_with_db
+    /// when a download slot frees up and Pending jobs are waiting.
+    pub fn run_trigger_tx(&self) -> broadcast::Sender<()> {
+        self.run_trigger_tx.clone()
     }
 
     fn emit_event(&self) {
@@ -117,48 +128,87 @@ impl QueueManager {
     // ── Control signals ───────────────────────────────────────────────────────
 
     pub async fn pause(&self, id: JobId) {
-        let jobs = self.jobs.read().await;
-        if let Some(&index) = self.job_index.read().await.get(&id) {
-            if let Some(job) = jobs.get(index) {
-                job.send_control(JobControl::Pause);
-                info!("Paused job #{id}");
+        {
+            let mut jobs = self.jobs.write().await;
+            let index = self.job_index.read().await.get(&id).copied();
+            if let Some(job) = index.and_then(|i| jobs.get_mut(i)) {
+                match &job.status {
+                    JobStatus::Active => {
+                        job.send_control(JobControl::Pause);
+                        info!("Paused active job #{id}");
+                    }
+                    _ => return, // Pending/Paused/terminal — no-op
+                }
             }
         }
         self.emit_event();
     }
 
     pub async fn cancel(&self, id: JobId) {
-        let is_paused = {
-            let jobs = self.jobs.read().await;
-            let index = self.job_index.read().await.get(&id).copied();
-            match index.and_then(|i| jobs.get(i)) {
-                Some(job) if job.status == JobStatus::Paused => true,
-                Some(job) => {
-                    job.send_control(JobControl::Cancel);
-                    info!("Cancelled job #{id}");
-                    false
-                }
-                None => return,
-            }
-        };
-
-        if is_paused {
+        // Immediately update in-memory status so TUI reflects cancel without
+        // waiting for the download task to asynchronously process the signal.
+        // The spawned task still handles DB update + run_trigger when it exits.
+        {
             let mut jobs = self.jobs.write().await;
-            if let Some(&index) = self.job_index.read().await.get(&id) {
-                if let Some(job) = jobs.get_mut(index) {
-                    job.status = JobStatus::Failed("Cancelled".into());
-                    info!("Cancelled paused job #{id}");
+            let index = self.job_index.read().await.get(&id).copied();
+            if let Some(job) = index.and_then(|i| jobs.get_mut(i)) {
+                match &job.status {
+                    JobStatus::Paused | JobStatus::Pending => {
+                        // Not running — set directly, no task to notify.
+                        job.status = JobStatus::Failed("Cancelled".into());
+                        job.ended_at = Some(std::time::Instant::now());
+                        info!("Cancelled paused/pending job #{id}");
+                    }
+                    JobStatus::Active => {
+                        // Signal the running task AND set status immediately so
+                        // TUI doesn't lag waiting for the task's cancel check loop.
+                        job.send_control(JobControl::Cancel);
+                        job.status = JobStatus::Failed("Cancelled".into());
+                        job.ended_at = Some(std::time::Instant::now());
+                        info!("Cancelled active job #{id}");
+                    }
+                    _ => return, // already terminal
                 }
+            } else {
+                return; // not found
             }
-        }
+        } // jobs write lock dropped here
 
         self.job_index.write().await.remove(&id);
+        // For Paused/Pending jobs there's no running task to fire run_trigger,
+        // so do it here — in case another Pending job is waiting for a slot.
+        let _ = self.run_trigger_tx.send(());
         self.emit_event();
     }
 
     pub async fn resume(&self, id: JobId) {
-        // Find the paused job, extract data, spawn download task directly
-        // (not via run_all_inner — avoids resuming OTHER paused jobs)
+        // ── Try to grab a semaphore slot BEFORE touching job state.
+        //    acquire_owned().await would block here while the QueueManager mutex
+        //    is held by the caller (handler.rs), starving every other IPC request
+        //    (including TUI Status polls) → UI freeze.
+        //    If no slot is free right now, flip the job to Pending so the
+        //    run_trigger_rx arm in server.rs picks it up the moment one opens.
+        let permit = match Arc::clone(&self.semaphore).try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                // No slot available. Set job back to Pending so the runner
+                // starts it automatically when a running download completes.
+                let mut jobs = self.jobs.write().await;
+                if let Some(&index) = self.job_index.read().await.get(&id) {
+                    if let Some(job) = jobs.get_mut(index) {
+                        if job.status == JobStatus::Paused {
+                            job.send_control(JobControl::Run); // clear Pause signal
+                            job.status = JobStatus::Pending;
+                            job.ended_at = None;
+                            info!("Resume #{id}: no slot, queued as Pending");
+                        }
+                    }
+                }
+                self.emit_event();
+                return;
+            }
+        };
+
         let job_data = {
             let mut jobs = self.jobs.write().await;
             if let Some(&index) = self.job_index.read().await.get(&id) {
@@ -191,14 +241,11 @@ impl QueueManager {
         };
 
         if let Some((id, url, output_path, connections, control_rx, downloaded, total_size_atomic, headers)) = job_data {
-            let permit = match Arc::clone(&self.semaphore).acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => return,
-            };
             let jobs = Arc::clone(&self.jobs);
             let job_index = Arc::clone(&self.job_index);
             let client = self.client.clone();
             let event_tx = self.event_tx();
+            let run_trigger_tx = self.run_trigger_tx.clone(); // NEW
 
             tokio::spawn(async move {
                 let _permit = permit;
@@ -208,6 +255,7 @@ impl QueueManager {
                     set_status(&jobs, id, JobStatus::Failed("Cancelled".into())).await;
                     remove_from_index(&job_index, id).await;
                     let _ = event_tx.send(ManagerEvent::JobsChanged);
+                    let _ = run_trigger_tx.send(()); // NEW: free slot, wake runner
                     return;
                 }
 
@@ -224,6 +272,7 @@ impl QueueManager {
                         }
                         remove_from_index(&job_index, id).await;
                         let _ = event_tx.send(ManagerEvent::JobsChanged);
+                        let _ = run_trigger_tx.send(()); // NEW: wake runner
                     }
                     Err(e) => {
                         let err_str = e.to_string();
@@ -240,6 +289,7 @@ impl QueueManager {
                             remove_from_index(&job_index, id).await;
                         }
                         let _ = event_tx.send(ManagerEvent::JobsChanged);
+                        let _ = run_trigger_tx.send(()); // NEW: wake runner
                     }
                 }
             });
@@ -344,13 +394,16 @@ impl QueueManager {
 
     // ── Run loops ─────────────────────────────────────────────────────────────
 
-    # [allow(dead_code)]
+    #[allow(dead_code)]
     pub async fn run_all(&self) -> Result<()> {
         self.run_all_inner(None).await
     }
 
     pub async fn run_all_with_db(&self, db: &SqlitePool) -> Result<()> {
-        if self.runner_running.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        if self.runner_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
             return Ok(());
         }
         let result = self.run_all_inner(Some(db.clone())).await;
@@ -360,9 +413,13 @@ impl QueueManager {
 
     async fn run_all_inner(&self, db: Option<SqlitePool>) -> Result<()> {
         loop {
+            // Find first Pending job and mark Active.
             let job_data = {
                 let mut jobs = self.jobs.write().await;
-                if let Some((_idx, job)) = jobs.iter_mut().enumerate().find(|(_, j)| matches!(j.status, JobStatus::Pending)) {
+                if let Some(job) = jobs
+                    .iter_mut()
+                    .find(|j| matches!(j.status, JobStatus::Pending))
+                {
                     job.status = JobStatus::Active;
                     job.ended_at = None;
                     if job.started_at.is_none() {
@@ -383,26 +440,46 @@ impl QueueManager {
                 }
             };
 
-            let (id, url, output_path, connections, control_rx, downloaded, total_size_atomic, headers) = match job_data {
-                Some(d) => d,
-                None => break,
-            };
+            let (id, url, output_path, connections, control_rx, downloaded, total_size_atomic, headers) =
+                match job_data {
+                    Some(d) => d,
+                    None => break, // no more Pending jobs
+                };
 
-            let permit = Arc::clone(&self.semaphore).acquire_owned().await?;
+            // ── KEY FIX ───────────────────────────────────────────────────────
+            // Use try_acquire instead of blocking acquire.
+            // Blocking here holds the QueueManager mutex (via &self), which
+            // starves Status requests from the TUI → UI freeze.
+            // If no permit is available, roll the job back to Pending and exit.
+            // The run_trigger_tx channel will re-fire run_all_with_db when a
+            // running download completes and a slot opens up.
+            let permit = match Arc::clone(&self.semaphore).try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    // Roll back: slot not free yet. Runner re-triggered on completion.
+                    let mut jobs = self.jobs.write().await;
+                    if let Some(job) = jobs.iter_mut().find(|j| j.id == id) {
+                        job.status = JobStatus::Pending;
+                        job.started_at = None;
+                    }
+                    break;
+                }
+            };
+            // ─────────────────────────────────────────────────────────────────
+
             let jobs = Arc::clone(&self.jobs);
             let job_index = Arc::clone(&self.job_index);
             let client = self.client.clone();
             let db = db.clone();
             let event_tx = self.event_tx();
+            let run_trigger_tx = self.run_trigger_tx.clone(); // NEW
 
             tokio::spawn(async move {
-                let _permit = permit;
+                let _permit = permit; // dropped at end of task → releases semaphore slot
 
                 if let Some(ref pool) = db {
                     let _ = update_job_status(pool, id as i64, "Active", 0, 0).await;
                 }
-
-                // Emit immediately on active status (job started)
                 let _ = event_tx.send(ManagerEvent::JobsChanged);
 
                 if *control_rx.borrow() == JobControl::Cancel {
@@ -412,69 +489,94 @@ impl QueueManager {
                     if let Some(ref pool) = db {
                         let _ = update_job_status(pool, id as i64, "Cancelled", 0, 0).await;
                     }
+                    let _ = run_trigger_tx.send(());
+                    return;
+                }
+
+                if *control_rx.borrow() == JobControl::Pause {
+                    set_status(&jobs, id, JobStatus::Paused).await;
+                    let _ = event_tx.send(ManagerEvent::JobsChanged);
+                    if let Some(ref pool) = db {
+                        let _ = update_job_status(
+                            pool,
+                            id as i64,
+                            "Paused",
+                            downloaded.load(Ordering::Relaxed),
+                            total_size_atomic.load(Ordering::Relaxed),
+                        )
+                        .await;
+                    }
+                    let _ = run_trigger_tx.send(());
                     return;
                 }
 
                 let engine = DownloadEngine::with_client(client, connections);
-                match engine.download(&url, &output_path, Some(downloaded.clone()), Some(total_size_atomic.clone()), &headers, control_rx).await {
-                    Ok((downloaded, total_size)) => {
-                        info!("Job #{id} complete — {downloaded}/{total_size} bytes");
+                match engine
+                    .download(
+                        &url,
+                        &output_path,
+                        Some(downloaded.clone()),
+                        Some(total_size_atomic.clone()),
+                        &headers,
+                        control_rx,
+                    )
+                    .await
+                {
+                    Ok((dl, total_size)) => {
+                        info!("Job #{id} complete — {dl}/{total_size} bytes");
                         set_status(&jobs, id, JobStatus::Done).await;
-                        // Update total_size for future reference
                         {
                             let mut jobs = jobs.write().await;
                             if let Some(job) = jobs.iter_mut().find(|j| j.id == id) {
                                 job.set_total_size(total_size);
                             }
                         }
-                    remove_from_index(&job_index, id).await;
-                    let _ = event_tx.send(ManagerEvent::JobsChanged);
-                    if let Some(ref pool) = db {
-                        let _ = update_job_status(
-                            pool, id as i64, "Done", downloaded, total_size,
-                        ).await;
-                    }
-                }
-                Err(e) => {
-                    let err_str = e.to_string();
-                    if err_str.contains("Paused") {
-                        info!("Job #{id} paused");
-                        set_status(&jobs, id, JobStatus::Paused).await;
+                        remove_from_index(&job_index, id).await;
                         let _ = event_tx.send(ManagerEvent::JobsChanged);
                         if let Some(ref pool) = db {
-                            let _ = update_job_status(
-                                pool,
-                                id as i64,
-                                "Paused",
-                                downloaded.load(Ordering::Relaxed),
-                                total_size_atomic.load(Ordering::Relaxed),
-                            ).await;
+                            let _ = update_job_status(pool, id as i64, "Done", dl, total_size).await;
                         }
-                        // Don't remove from index - can be resumed
-                    } else if err_str.contains("Cancelled") {
-                        info!("Job #{id} cancelled");
-                        set_status(&jobs, id, JobStatus::Failed("Cancelled".into())).await;
-                        remove_from_index(&job_index, id).await;
+                        // Slot freed — wake runner
+                        let _ = run_trigger_tx.send(());
+                    }
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        if err_str.contains("Paused") {
+                            info!("Job #{id} paused");
+                            set_status(&jobs, id, JobStatus::Paused).await;
                             let _ = event_tx.send(ManagerEvent::JobsChanged);
                             if let Some(ref pool) = db {
                                 let _ = update_job_status(
-                                    pool, id as i64, "Cancelled", 0, 0,
-                                ).await;
+                                    pool,
+                                    id as i64,
+                                    "Paused",
+                                    downloaded.load(Ordering::Relaxed),
+                                    total_size_atomic.load(Ordering::Relaxed),
+                                )
+                                .await;
                             }
+                            // Paused job frees its slot — wake runner for next Pending
+                            let _ = run_trigger_tx.send(());
+                        } else if err_str.contains("Cancelled") {
+                            info!("Job #{id} cancelled");
+                            set_status(&jobs, id, JobStatus::Failed("Cancelled".into())).await;
+                            remove_from_index(&job_index, id).await;
+                            let _ = event_tx.send(ManagerEvent::JobsChanged);
+                            if let Some(ref pool) = db {
+                                let _ = update_job_status(pool, id as i64, "Cancelled", 0, 0).await;
+                            }
+                            let _ = run_trigger_tx.send(());
                         } else {
                             error!("Job #{id} failed: {e}");
                             set_status(&jobs, id, JobStatus::Failed(e.to_string())).await;
                             remove_from_index(&job_index, id).await;
                             let _ = event_tx.send(ManagerEvent::JobsChanged);
                             if let Some(ref pool) = db {
-                                let _ = update_job_status(
-                                    pool,
-                                    id as i64,
-                                    &format!("Failed: {e}"),
-                                    0,
-                                    0,
-                                ).await;
+                                let _ =
+                                    update_job_status(pool, id as i64, &format!("Failed: {e}"), 0, 0)
+                                        .await;
                             }
+                            let _ = run_trigger_tx.send(());
                         }
                     }
                 }
@@ -488,7 +590,6 @@ impl QueueManager {
 async fn set_status(jobs: &RwLock<VecDeque<DownloadJob>>, id: JobId, status: JobStatus) {
     let mut jobs = jobs.write().await;
     if let Some(job) = jobs.iter_mut().find(|j| j.id == id) {
-        // Record end time before moving status
         match &status {
             JobStatus::Paused | JobStatus::Done | JobStatus::Failed(_) => {
                 job.ended_at = Some(std::time::Instant::now());

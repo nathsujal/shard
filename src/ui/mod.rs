@@ -400,10 +400,15 @@ async fn run_loop(
                         (KeyCode::Tab, _) => app.next_tab(),
                         (KeyCode::Char('p'), _) => {
                             if let Some(job) = app.selected_job() {
-                                if job.status == "Paused" {
-                                    let _ = send_request(&Request::Resume { id: job.id }).await;
-                                } else {
-                                    let _ = send_request(&Request::Pause { id: job.id }).await;
+                                match job.status.as_str() {
+                                    "Paused" => {
+                                        let _ = send_request(&Request::Resume { id: job.id }).await;
+                                    }
+                                    "Active" => {
+                                        let _ = send_request(&Request::Pause { id: job.id }).await;
+                                    }
+                                    // Pending, Done, Failed — no-op
+                                    _ => {}
                                 }
                                 app.poll_daemon().await;
                             }
