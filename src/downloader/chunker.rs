@@ -1,4 +1,5 @@
 use reqwest::Client;
+use tracing::{debug, warn};
 
 use super::error::DownloadError;
 
@@ -24,12 +25,38 @@ pub struct ServerProbe {
 }
 
 /// HEAD request → get file size + check Accept-Ranges header.
-pub async fn probe_url(client: &Client, url: &str) -> Result<ServerProbe, DownloadError> {
-    let response = client.head(url).send().await?;
+pub async fn probe_url(client: &Client, url: &str, headers: &[(String, String)]) -> Result<ServerProbe, DownloadError> {
+    let mut request = client.head(url);
+    
+    // Add default headers
+    if let Some(host_start) = url.find("://") {
+        let after_scheme = &url[host_start + 3..];
+        if let Some(slash_pos) = after_scheme.find('/') {
+            let host = &after_scheme[..slash_pos];
+            request = request.header("Referer", &format!("https://{}", host));
+        } else {
+            request = request.header("Referer", &format!("https://{}", after_scheme));
+        }
+    }
+    
+    // Add user-provided headers
+    for (key, value) in headers {
+        request = request.header(key.as_str(), value.as_str());
+    }
+    let response = request.send().await?;
 
-    if !response.status().is_success() {
+    let status = response.status();
+    debug!("Probe response status: {}", status);
+    
+    // Log all response headers for debugging
+    for (name, value) in response.headers() {
+        debug!("  {}: {:?}", name.as_str(), value.to_str().unwrap_or("[binary]"));
+    }
+
+    if !status.is_success() {
+        warn!("Probe failed with status {} for URL: {}", status, url);
         return Err(DownloadError::HttpError {
-            status: response.status().as_u16(),
+            status: status.as_u16(),
         });
     }
 
@@ -46,6 +73,8 @@ pub async fn probe_url(client: &Client, url: &str) -> Result<ServerProbe, Downlo
         .and_then(|v| v.to_str().ok())
         .map(|v| v != "none")
         .unwrap_or(false);
+
+    debug!("Probe OK: size={}, ranges={}", total_size, supports_ranges);
 
     Ok(ServerProbe {
         total_size,

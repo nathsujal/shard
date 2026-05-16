@@ -12,6 +12,15 @@ pub struct Settings {
 
     /// Speed limit in bytes/sec (0 = unlimited)
     pub speed_limit: u64,
+
+    /// Auto-prune completed jobs on daemon startup
+    pub prune_enabled: bool,
+
+    /// Keep job history for N days (older deleted on prune)
+    pub prune_days: u32,
+
+    /// Which statuses to prune (e.g. ["Done", "Failed"])
+    pub prune_statuses: Vec<String>,
 }
 
 impl Default for Settings {
@@ -20,6 +29,9 @@ impl Default for Settings {
             download_dir: dirs_next(),
             max_connections: 4,
             speed_limit: 0,
+            prune_enabled: true,
+            prune_days: 30,
+            prune_statuses: vec!["Done".into(), "Failed".into()],
         }
     }
 }

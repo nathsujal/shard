@@ -8,7 +8,8 @@ use sqlx::SqlitePool;
 use tokio::sync::{watch, Mutex};
 use tracing::{error, info};
 
-use crate::db::schema::{delete_job, insert_job, update_job_status};
+use crate::config::Settings;
+use crate::db::schema::{insert_job, load_history, prune_history, update_job_status};
 use crate::ipc::message::{JobSummary, Request, Response};
 use crate::queue::manager::QueueManager;
 use crate::utils::filename_from_url;
@@ -32,11 +33,18 @@ pub async fn handle_request(
     match request {
         // Add URLs
         Request::Add {
-            urls,
-            output_dir,
-            connections,
-        } => {
-            let base = PathBuf::from(&output_dir);
+                urls,
+                output_dir,
+                connections,
+                headers,
+            } => {
+                let base = if let Some(dir) = output_dir {
+                    PathBuf::from(dir)
+                } else {
+                    Settings::load()
+                        .unwrap_or_default()
+                        .download_dir
+                };
             let mut ids = Vec::new();
 
             for url in &urls {
@@ -58,7 +66,7 @@ pub async fn handle_request(
                 // Add to in-memory queue using the DB id so they stay in sync.
                 {
                     let mgr = manager.lock().await;
-                    mgr.add_with_id(db_id as u64, url.clone(), output_path, connections)
+                    mgr.add_with_id(db_id as u64, url.clone(), output_path, connections, headers.clone(), None, 0, 0, None, None)
                         .await;
                 }
 
@@ -93,13 +101,26 @@ pub async fn handle_request(
             }
         }
 
+        Request::Resume { id } => {
+            let mgr = manager.lock().await;
+            mgr.resume(id).await;
+
+            if let Err(e) = update_job_status(db, id as i64, "Active", 0, 0).await {
+                error!("DB update failed on resume: {e}");
+            }
+
+            Response::Ok {
+                message: format!("Job #{id} resumed"),
+            }
+        }
+
         // Cancel
         Request::Cancel { id } => {
             let mgr = manager.lock().await;
             mgr.cancel(id).await;
 
-            if let Err(e) = delete_job(db, id as i64).await {
-                error!("DB delete failed on cancel: {e}");
+            if let Err(e) = update_job_status(db, id as i64, "Cancelled", 0, 0).await {
+                error!("DB update status failed on cancel: {e}");
             }
 
             Response::Ok {
@@ -129,6 +150,50 @@ pub async fn handle_request(
             let _ = shutdown_tx.send(true);
             Response::Ok {
                 message: "Daemon shutting down".into(),
+            }
+        }
+
+        // Subscribe / Unsubscribe handled directly in server for persistent connections
+        Request::Subscribe { .. } | Request::Unsubscribe => {
+            Response::Error {
+                message: "Subscribe only valid over persistent connection".into(),
+            }
+        }
+
+        // History
+        Request::History { limit } => {
+            let jobs = match load_history(db, limit).await {
+                Ok(jobs) => jobs,
+                Err(e) => {
+                    error!("Failed to load history: {e}");
+                    return Response::Error {
+                        message: format!("Failed to load history: {e}"),
+                    };
+                }
+            };
+            Response::JobList { jobs }
+        }
+
+        // Prune
+        Request::Prune {
+            days,
+            statuses,
+            dry_run,
+        } => {
+            if dry_run {
+                return Response::PruneResult {
+                    count: 0,
+                    message: format!("Dry run — would prune history older than {days} days with statuses {statuses:?}"),
+                };
+            }
+            match prune_history(db, days, &statuses).await {
+                Ok(count) => Response::PruneResult {
+                    count,
+                    message: format!("Pruned {count} old jobs from history"),
+                },
+                Err(e) => Response::Error {
+                    message: format!("Prune failed: {e}"),
+                },
             }
         }
     }

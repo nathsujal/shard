@@ -29,26 +29,28 @@ impl PartState {
         self.completed_chunks.insert(index);
     }
 
+    #[allow(dead_code)]
     pub fn is_complete(&self) -> bool {
         self.completed_chunks.len() == self.num_chunks as usize
     }
 
-    pub fn pending_chunks(&self) -> Vec<usize> {
+    #[allow(dead_code)]
+    pub fn pending_count(&self) -> usize {
+        self.num_chunks as usize - self.completed_chunks.len()
+    }
+
+    pub fn pending_indices(&self) -> impl Iterator<Item = usize> + '_ {
         (0..self.num_chunks as usize)
             .filter(|i| !self.completed_chunks.contains(i))
-            .collect()
     }
 }
 
 /// `.part` file lives alongside the output file: `file.zip` → `file.zip.part`
 pub fn part_path(output_path: &Path) -> PathBuf {
     let mut p = output_path.to_path_buf();
-    let name = p
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned();
-    p.set_file_name(format!("{name}.part"));
+    let mut name = p.file_name().unwrap_or_default().to_os_string();
+    name.push(".part");
+    p.set_file_name(name);
     p
 }
 
@@ -60,7 +62,7 @@ pub async fn load_state(output_path: &Path) -> Option<PartState> {
 
 pub async fn save_state(output_path: &Path, state: &PartState) -> Result<()> {
     let path = part_path(output_path);
-    let contents = serde_json::to_string_pretty(state)?;
+    let contents = serde_json::to_string(state)?;
     fs::write(&path, contents).await?;
     Ok(())
 }
