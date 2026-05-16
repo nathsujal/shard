@@ -1,6 +1,8 @@
+//! CLI entrypoint: parses arguments and dispatches to daemon (via IPC) or direct download.
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::error;
  
@@ -247,7 +249,7 @@ impl Cli {
  
 // ── Helpers ──────────────────────────────────────────────────────────────────
  
-fn resolve_output(url: &str, output: Option<PathBuf>, download_dir: &PathBuf) -> PathBuf {
+fn resolve_output(url: &str, output: Option<PathBuf>, download_dir: &Path) -> PathBuf {
     output.unwrap_or_else(|| download_dir.join(filename_from_url(url)))
 }
  

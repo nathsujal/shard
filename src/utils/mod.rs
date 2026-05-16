@@ -1,7 +1,9 @@
+//! Shared utility functions.
+
 /// Extract filename from a URL's path segment.
 pub fn filename_from_url(url: &str) -> String {
-    url.split('/')
-        .last()
+    url.rsplit('/')
+        .next()
         .filter(|s| !s.is_empty())
         .unwrap_or("downloaded_file")
         .to_string()

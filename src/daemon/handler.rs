@@ -1,5 +1,4 @@
-// Parses incoming JSON request, calls the right QueueManager method,
-// persists changes to DB, and returns a Response.
+//! Parses incoming JSON requests, dispatches to QueueManager, persists to DB.
 
 use std::path::PathBuf;
 use std::sync::Arc;

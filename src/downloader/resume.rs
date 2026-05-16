@@ -1,3 +1,5 @@
+//! Resume state persistence: `.part` file format for pause/resume across daemon restarts.
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -27,16 +29,6 @@ impl PartState {
 
     pub fn mark_done(&mut self, index: usize) {
         self.completed_chunks.insert(index);
-    }
-
-    #[allow(dead_code)]
-    pub fn is_complete(&self) -> bool {
-        self.completed_chunks.len() == self.num_chunks as usize
-    }
-
-    #[allow(dead_code)]
-    pub fn pending_count(&self) -> usize {
-        self.num_chunks as usize - self.completed_chunks.len()
     }
 
     pub fn pending_indices(&self) -> impl Iterator<Item = usize> + '_ {

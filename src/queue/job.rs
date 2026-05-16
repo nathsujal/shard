@@ -1,3 +1,5 @@
+//! Job state machine: `DownloadJob`, `JobStatus`, `JobControl` signals via watch channel.
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;

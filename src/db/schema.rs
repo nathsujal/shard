@@ -1,6 +1,4 @@
-// SQLite persistence layer via sqlx.
-// Daemon loads jobs on startup (to recover from crash/restart).
-// Jobs are written on add, updated on status change, deleted on cancel/done.
+//! SQLite persistence via sqlx: insert, update, archive, prune, migration.
 
 use anyhow::Result;
 use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
@@ -162,16 +160,6 @@ pub async fn update_job_status(
     Ok(())
 }
 
-/// Delete a job row (used on cancel).
-#[allow(dead_code)]
-pub async fn delete_job(pool: &SqlitePool, id: i64) -> Result<()> {
-    sqlx::query("DELETE FROM jobs WHERE id = ?")
-        .bind(id)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
 /// Load recoverable jobs on daemon startup — only Pending (not Paused).
 pub async fn load_pending_jobs(pool: &SqlitePool) -> Result<Vec<JobSummary>> {
     let rows = sqlx::query_as::<_, DbJobRow>(
@@ -185,65 +173,10 @@ pub async fn load_pending_jobs(pool: &SqlitePool) -> Result<Vec<JobSummary>> {
     Ok(rows.into_iter().map(|r| r.into()).collect())
 }
 
-/// Load active jobs for status display.
-#[allow(dead_code)]
-pub async fn load_active_jobs(pool: &SqlitePool) -> Result<Vec<JobSummary>> {
-    let rows = sqlx::query_as::<_, DbJobRow>(
-        "SELECT id, url, output_path, connections, total_size, downloaded, status
-         FROM jobs
-         ORDER BY id ASC",
-    )
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows.into_iter().map(|r| r.into()).collect())
-}
-
-/// Move a job from active table to history (called on Done/Failed/Cancelled).
-#[allow(dead_code)]
-pub async fn move_to_history(
-    pool: &SqlitePool,
-    id: i64,
-    status: &str,
-    downloaded: u64,
-    total_size: u64,
-) -> Result<()> {
-    // Update final values before copying
-    sqlx::query(
-        "UPDATE jobs SET status = ?, downloaded = ?, total_size = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-    )
-    .bind(status)
-    .bind(downloaded as i64)
-    .bind(total_size as i64)
-    .bind(id)
-    .execute(pool)
-    .await?;
-
-    // Copy row to history (REPLACE handles SQLite autoincrement ID reuse)
-    sqlx::query(
-        "INSERT OR REPLACE INTO job_history
-         (id, url, output_path, connections, total_size, downloaded, status, created_at, updated_at, completed_at)
-         SELECT id, url, output_path, connections, total_size, downloaded, status, created_at, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-         FROM jobs WHERE id = ?",
-    )
-    .bind(id)
-    .execute(pool)
-    .await?;
-
-    // Remove from active
-    sqlx::query("DELETE FROM jobs WHERE id = ?")
-        .bind(id)
-        .execute(pool)
-        .await?;
-
-    Ok(())
-}
-
 /// Batch-move terminal jobs to history on daemon shutdown.
 /// Active → Paused (resumable on next start).
 /// Done/Failed/Cancelled → job_history.
 /// Paused/Pending stay in jobs (survive restart).
-#[allow(dead_code)]
 pub async fn archive_jobs(pool: &SqlitePool) -> Result<u64> {
     // 1. Active → Paused (in-flight downloads become resumable)
     sqlx::query(
@@ -346,7 +279,6 @@ struct DbJobRow {
     pub id: i64,
     pub url: String,
     pub output_path: String,
-    #[allow(dead_code)]
     pub connections: i64,
     pub total_size: i64,
     pub downloaded: i64,
@@ -357,7 +289,7 @@ struct DbJobRow {
 
 /// Parse "YYYY-MM-DD HH:MM:SS" SQLite datetime to Unix epoch seconds.
 fn sqlite_datetime_to_epoch(s: &str) -> Option<i64> {
-    let parts: Vec<&str> = s.split(|c| c == ' ' || c == '-' || c == ':').collect();
+    let parts: Vec<&str> = s.split([' ', '-', ':']).collect();
     if parts.len() != 6 {
         return None;
     }
@@ -376,9 +308,9 @@ fn sqlite_datetime_to_epoch(s: &str) -> Option<i64> {
     }
     // Month days
     let month_days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    for m in 0..month.saturating_sub(1) {
-        days += month_days[m];
-        if m == 1 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0) { days += 1; }
+    for (i, &md) in month_days.iter().enumerate().take(month.saturating_sub(1)) {
+        days += md;
+        if i == 1 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0) { days += 1; }
     }
     days += day.saturating_sub(1);
 
@@ -417,13 +349,12 @@ struct DbHistoryRow {
     pub id: i64,
     pub url: String,
     pub output_path: String,
-    #[allow(dead_code)]
     pub connections: i64,
     pub total_size: i64,
     pub downloaded: i64,
     pub status: String,
     #[allow(dead_code)]
-    pub completed_at: String,
+    pub completed_at: String, // used by sqlx::FromRow derive, never read in Rust code
 }
 
 impl From<DbHistoryRow> for JobSummary {

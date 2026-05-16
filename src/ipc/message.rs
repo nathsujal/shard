@@ -1,3 +1,5 @@
+//! Wire protocol types: `Request`, `Response`, `JobSummary` — serialized as NDJSON over Unix socket.
+
 use serde::{Deserialize, Serialize};
 
 /// Messages sent FROM the CLI client TO the daemon.

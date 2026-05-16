@@ -1,3 +1,5 @@
+//! In-memory job queue: add, pause, cancel, resume, semaphore-controlled concurrent download.
+
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -8,7 +10,7 @@ use anyhow::Result;
 use reqwest::Client;
 use sqlx::SqlitePool;
 use tokio::sync::{broadcast, RwLock, Semaphore};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::db::schema::update_job_status;
 use crate::downloader::engine::DownloadEngine;
@@ -76,13 +78,7 @@ impl QueueManager {
         let _ = self.event_tx.send(ManagerEvent::JobsChanged);
     }
 
-    #[allow(dead_code)]
-    pub async fn add(&self, url: String, output_path: PathBuf, connections: u8, headers: Vec<(String, String)>) -> JobId {
-        let id = self.next_id.fetch_add(1, Ordering::AcqRel);
-        self.add_with_id(id, url, output_path, connections, headers, None, 0, 0, None, None).await;
-        id
-    }
-
+    #[allow(clippy::too_many_arguments)]
     pub async fn add_with_id(
         &self,
         id: JobId,
@@ -298,20 +294,6 @@ impl QueueManager {
         self.emit_event();
     }
 
-    #[allow(dead_code)]
-    pub async fn move_up(&self, id: JobId) {
-        let mut jobs = self.jobs.write().await;
-        if let Some(pos) = jobs.iter().position(|j| j.id == id) {
-            if pos > 0 {
-                jobs.swap(pos, pos - 1);
-                self.job_index.write().await.clear();
-                for (i, job) in jobs.iter().enumerate() {
-                    self.job_index.write().await.insert(job.id, i);
-                }
-            }
-        }
-    }
-
     // ── Status snapshot ───────────────────────────────────────────────────────
 
     pub async fn job_summaries(&self) -> Vec<JobSummary> {
@@ -365,39 +347,7 @@ impl QueueManager {
             .collect()
     }
 
-    #[allow(dead_code)]
-    pub async fn print_status(&self) {
-        let jobs = self.jobs.read().await;
-        if jobs.is_empty() {
-            println!("Queue is empty.");
-            return;
-        }
-        println!("\n{:<5} {:<50} {:<10} {:<8}", "ID", "URL", "STATUS", "PROGRESS");
-        println!("{}", "─".repeat(80));
-        for job in jobs.iter() {
-            let url_ref: &str = &job.url;
-            let url_short = if url_ref.len() > 48 {
-                format!("{}…", &url_ref[..47])
-            } else {
-                url_ref.to_string()
-            };
-            println!(
-                "{:<5} {:<50} {:<10} {:.1}%",
-                job.id,
-                url_short,
-                job.status,
-                job.progress_pct()
-            );
-        }
-        println!();
-    }
-
     // ── Run loops ─────────────────────────────────────────────────────────────
-
-    #[allow(dead_code)]
-    pub async fn run_all(&self) -> Result<()> {
-        self.run_all_inner(None).await
-    }
 
     pub async fn run_all_with_db(&self, db: &SqlitePool) -> Result<()> {
         if self.runner_running
@@ -478,7 +428,9 @@ impl QueueManager {
                 let _permit = permit; // dropped at end of task → releases semaphore slot
 
                 if let Some(ref pool) = db {
-                    let _ = update_job_status(pool, id as i64, "Active", 0, 0).await;
+                    if let Err(e) = update_job_status(pool, id as i64, "Active", 0, 0).await {
+                        warn!("Failed to persist Active status for #{id}: {e}");
+                    }
                 }
                 let _ = event_tx.send(ManagerEvent::JobsChanged);
 
@@ -487,7 +439,9 @@ impl QueueManager {
                     remove_from_index(&job_index, id).await;
                     let _ = event_tx.send(ManagerEvent::JobsChanged);
                     if let Some(ref pool) = db {
-                        let _ = update_job_status(pool, id as i64, "Cancelled", 0, 0).await;
+                        if let Err(e) = update_job_status(pool, id as i64, "Cancelled", 0, 0).await {
+                            warn!("Failed to persist Cancelled status for #{id}: {e}");
+                        }
                     }
                     let _ = run_trigger_tx.send(());
                     return;
@@ -497,14 +451,17 @@ impl QueueManager {
                     set_status(&jobs, id, JobStatus::Paused).await;
                     let _ = event_tx.send(ManagerEvent::JobsChanged);
                     if let Some(ref pool) = db {
-                        let _ = update_job_status(
+                        if let Err(e) = update_job_status(
                             pool,
                             id as i64,
                             "Paused",
                             downloaded.load(Ordering::Relaxed),
                             total_size_atomic.load(Ordering::Relaxed),
                         )
-                        .await;
+                        .await
+                        {
+                            warn!("Failed to persist Paused status for #{id}: {e}");
+                        }
                     }
                     let _ = run_trigger_tx.send(());
                     return;
@@ -534,9 +491,10 @@ impl QueueManager {
                         remove_from_index(&job_index, id).await;
                         let _ = event_tx.send(ManagerEvent::JobsChanged);
                         if let Some(ref pool) = db {
-                            let _ = update_job_status(pool, id as i64, "Done", dl, total_size).await;
+                            if let Err(e) = update_job_status(pool, id as i64, "Done", dl, total_size).await {
+                                warn!("Failed to persist Done status for #{id}: {e}");
+                            }
                         }
-                        // Slot freed — wake runner
                         let _ = run_trigger_tx.send(());
                     }
                     Err(e) => {
@@ -546,16 +504,18 @@ impl QueueManager {
                             set_status(&jobs, id, JobStatus::Paused).await;
                             let _ = event_tx.send(ManagerEvent::JobsChanged);
                             if let Some(ref pool) = db {
-                                let _ = update_job_status(
+                                if let Err(e) = update_job_status(
                                     pool,
                                     id as i64,
                                     "Paused",
                                     downloaded.load(Ordering::Relaxed),
                                     total_size_atomic.load(Ordering::Relaxed),
                                 )
-                                .await;
+                                .await
+                                {
+                                    warn!("Failed to persist Paused status for #{id}: {e}");
+                                }
                             }
-                            // Paused job frees its slot — wake runner for next Pending
                             let _ = run_trigger_tx.send(());
                         } else if err_str.contains("Cancelled") {
                             info!("Job #{id} cancelled");
@@ -563,7 +523,9 @@ impl QueueManager {
                             remove_from_index(&job_index, id).await;
                             let _ = event_tx.send(ManagerEvent::JobsChanged);
                             if let Some(ref pool) = db {
-                                let _ = update_job_status(pool, id as i64, "Cancelled", 0, 0).await;
+                                if let Err(e) = update_job_status(pool, id as i64, "Cancelled", 0, 0).await {
+                                    warn!("Failed to persist Cancelled status for #{id}: {e}");
+                                }
                             }
                             let _ = run_trigger_tx.send(());
                         } else {
@@ -572,9 +534,12 @@ impl QueueManager {
                             remove_from_index(&job_index, id).await;
                             let _ = event_tx.send(ManagerEvent::JobsChanged);
                             if let Some(ref pool) = db {
-                                let _ =
+                                if let Err(e) =
                                     update_job_status(pool, id as i64, &format!("Failed: {e}"), 0, 0)
-                                        .await;
+                                        .await
+                                {
+                                    warn!("Failed to persist Failed status for #{id}: {e}");
+                                }
                             }
                             let _ = run_trigger_tx.send(());
                         }
